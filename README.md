@@ -114,6 +114,14 @@ the widget reads that file via `host.request('cli.exec', ['quota','status','--js
 > absolute cap. The plugin shows remaining **%** and **time-to-reset**, not a
 > token or dollar count.
 
+**OpenCode (Go)** reads `GET https://opencode.ai/zen/go/v1/usage`, whose key is
+resolved from `OPENCODE_API_KEY`, then `OPENCODE_GO_API_KEY` (the name Hermes'
+own `opencode-go` chat provider uses in `~/.hermes/.env`), then OpenCode's CLI
+auth file `~/.local/share/opencode/auth.json`. That endpoint intermittently
+answers `503 Go usage is unavailable` for a large share of calls regardless of
+credential or User-Agent, so the fetcher retries before reporting the provider
+unavailable.
+
 ## Privacy & safety
 
 - No telemetry. Cookies and tokens are never printed.

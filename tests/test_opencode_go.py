@@ -53,6 +53,123 @@ class CredentialResolutionTests(unittest.TestCase):
             mod.os.environ.pop("OPENCODE_API_KEY", None)
             self.assertIsNone(mod._read_env_api_key())
 
+    def test_opencode_go_env_key_is_accepted(self):
+        """Hermes' own opencode-go chat provider stores the key under this name."""
+        mod = load_module()
+        with mock.patch.dict(mod.os.environ, {}, clear=False):
+            mod.os.environ.pop("OPENCODE_API_KEY", None)
+            mod.os.environ["OPENCODE_GO_API_KEY"] = "sk-go-key"
+            self.assertEqual(mod._read_env_api_key(), "sk-go-key")
+
+    def test_opencode_api_key_wins_over_go_alias(self):
+        mod = load_module()
+        with mock.patch.dict(mod.os.environ, {}, clear=False):
+            mod.os.environ["OPENCODE_API_KEY"] = "sk-zen-key"
+            mod.os.environ["OPENCODE_GO_API_KEY"] = "sk-go-key"
+            self.assertEqual(mod._read_env_api_key(), "sk-zen-key")
+
+
+class LivePayloadTests(unittest.TestCase):
+    """Shape returned by GET /zen/go/v1/usage (verified against the live API)."""
+
+    LIVE = {
+        "usage": {
+            "rolling": {"status": "ok", "percent": 4, "resetsAt": "2026-09-18T14:39:39.695Z"},
+            "weekly": {"status": "ok", "percent": 1, "resetsAt": "2026-09-21T00:00:00.000Z"},
+            "monthly": {"status": "ok", "percent": 0, "resetsAt": "2026-10-16T16:51:09.000Z"},
+        }
+    }
+
+    def test_all_three_windows_parse_with_absolute_resets(self):
+        mod = load_module()
+        windows = mod.parse_usage_payload(self.LIVE, now=0)
+        self.assertEqual([w.label for w in windows], ["5-hour", "Weekly", "Monthly"])
+        self.assertEqual([w.used_percent for w in windows], [4.0, 1.0, 0.0])
+        self.assertIn("2026-09-18T14:39:39", windows[0].reset_at)
+        self.assertIn("2026-10-16T16:51:09", windows[2].reset_at)
+
+    def test_windows_stay_visible_when_rolling_is_zero(self):
+        """percent 0 is real data, not a missing value."""
+        mod = load_module()
+        payload = {"usage": {"rolling": {"status": "ok", "percent": 0, "resetsAt": "2026-09-18T14:39:39.695Z"}}}
+        windows = mod.parse_usage_payload(payload, now=0)
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].used_percent, 0.0)
+
+
+class TransientFailureTests(unittest.TestCase):
+    """The usage endpoint flaps with 503 'Go usage is unavailable' (~20-40% of
+    calls, independent of User-Agent); a single attempt is not enough."""
+
+    LIVE_BODY = json.dumps(LivePayloadTests.LIVE).encode()
+
+    def _response(self, body):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return body
+
+        return _Resp()
+
+    def _patch_urlopen(self, mod, outcomes):
+        """outcomes: list of 'ok' | 503 | 500 | URLError."""
+        import urllib.error
+
+        calls = {"n": 0}
+
+        def fake_urlopen(*args, **kwargs):
+            index = min(calls["n"], len(outcomes) - 1)
+            calls["n"] += 1
+            kind = outcomes[index]
+            if kind == "ok":
+                return self._response(self.LIVE_BODY)
+            if kind == "URLError":
+                raise urllib.error.URLError("connection reset")
+            raise urllib.error.HTTPError(mod._API_URL, kind, "boom", hdrs=None, fp=None)
+
+        mod.urllib.request.urlopen = fake_urlopen
+        return calls
+
+    def _run(self, mod, outcomes, attempts=4):
+        original = mod.urllib.request.urlopen
+        try:
+            calls = self._patch_urlopen(mod, outcomes)
+            result = mod.fetch_usage("sk-test", attempts=attempts, _sleep=lambda _s: None)
+        finally:
+            mod.urllib.request.urlopen = original
+        return result, calls["n"]
+
+    def test_503_is_retried_until_success(self):
+        mod = load_module()
+        result, calls = self._run(mod, [503, 503, "ok"])
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual([w.used_percent for w in result.windows], [4.0, 1.0, 0.0])
+        self.assertEqual(calls, 3)
+
+    def test_network_error_is_retried(self):
+        mod = load_module()
+        result, calls = self._run(mod, ["URLError", "ok"])
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(calls, 2)
+
+    def test_persistent_503_reports_vendor_wording(self):
+        mod = load_module()
+        result, calls = self._run(mod, [503], attempts=4)
+        self.assertEqual(result.unavailable_reason, "usage-unavailable")
+        self.assertEqual(calls, 4)
+        self.assertEqual(result.windows, [])
+
+    def test_auth_failure_is_never_retried(self):
+        mod = load_module()
+        result, calls = self._run(mod, [401])
+        self.assertEqual(result.unavailable_reason, "auth-failed")
+        self.assertEqual(calls, 1)
+
 
 class PayloadParsingTests(unittest.TestCase):
     def test_canonical_codexbar_shape(self):
@@ -74,6 +191,12 @@ class PayloadParsingTests(unittest.TestCase):
         payload = {"rollingUsage": {"usagePercent": 0.25, "resetInSec": 60}}
         windows = mod.parse_usage_payload(payload, now=0)
         self.assertAlmostEqual(windows[0].used_percent, 25.0)
+
+    def test_integer_percent_one_is_not_rescaled(self):
+        mod = load_module()
+        payload = {"rollingUsage": {"percent": 1, "resetInSec": 60}}
+        windows = mod.parse_usage_payload(payload, now=0)
+        self.assertAlmostEqual(windows[0].used_percent, 1.0)
 
     def test_used_over_limit_computation(self):
         mod = load_module()

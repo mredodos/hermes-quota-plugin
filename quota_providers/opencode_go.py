@@ -17,11 +17,19 @@ The API key is the OpenCode Zen key copied from the console
 
 1. ``OPENCODE_API_KEY`` environment variable (the same var OpenCode itself
    and CodexBar read);
-2. ``opencode`` entry in OpenCode's own auth file,
+2. ``OPENCODE_GO_API_KEY`` environment variable — Hermes' own ``opencode-go``
+   *chat* provider keeps the same Zen key under this name in ``~/.hermes/.env``,
+   so a working Go key is honoured instead of being reported as missing;
+3. ``opencode`` entry in OpenCode's own auth file,
    ``~/.local/share/opencode/auth.json`` (written by ``opencode auth login``
    / the ``/connect`` TUI command).  The file stores one record per provider;
    we accept either a plain API-key object or an OAuth record whose nested
    payload carries the key.
+
+The usage endpoint is flaky on the vendor's side: it answers
+``503 {"message":"Go usage is unavailable"}`` for a large share of calls no
+matter which User-Agent or credential is used, so every transient failure is
+retried (``_RETRY_ATTEMPTS``) before the provider is reported unavailable.
 
 Note on OAuth: OpenCode's CLI supports an OAuth *device flow* against the
 console (``POST {console}/auth/device/code`` → ``/auth/device/token`` with
@@ -51,6 +59,16 @@ from .base import QuotaResult, QuotaWindow, build_unavailable
 
 _PROVIDER_ID = "opencode-go"
 _API_URL = "https://opencode.ai/zen/go/v1/usage"
+
+# The usage endpoint flaps: it answers 503 {"message":"Go usage is unavailable"}
+# for roughly a fifth to a third of calls, independently of the User-Agent or
+# the credential (verified 2026-09-18: same key, same second, mixed 200/503
+# across three UAs).  A single attempt therefore loses the provider at random,
+# so every transient failure is retried with a short backoff.
+_RETRY_ATTEMPTS = 4
+_RETRY_BACKOFF_SECONDS = (0.25, 0.5, 1.0)
+_TRANSIENT_HTTP_STATUSES = (429, 500, 502, 504)
+
 def _auth_file_candidates() -> tuple[str, ...]:
     """Known locations of OpenCode's local auth file across platforms.
 
@@ -70,7 +88,12 @@ def _auth_file_candidates() -> tuple[str, ...]:
 
 
 _AUTH_PATHS = _auth_file_candidates()
-_ENV_KEYS = ("OPENCODE_API_KEY",)
+# ``OPENCODE_API_KEY`` is the name OpenCode's own CLI and CodexBar use for the
+# Zen key.  Hermes' *chat* provider ``opencode-go`` stores the same Zen key
+# under ``OPENCODE_GO_API_KEY`` in ``~/.hermes/.env``, so a machine can hold a
+# perfectly good Go key that this fetcher never looked at.  Accept both, the
+# canonical name first.
+_ENV_KEYS = ("OPENCODE_API_KEY", "OPENCODE_GO_API_KEY")
 
 _PERCENT_KEYS = (
     "usagePercent",
@@ -238,8 +261,9 @@ def _window_percent(window: dict) -> Optional[float]:
     if percent is None:
         return None
     # A direct percent may arrive as a fraction (0..1); computed used/limit
-    # values are already 0..100 and must not be rescaled.
-    if direct and 0.0 <= percent <= 1.0:
+    # values are already 0..100 and must not be rescaled. Integral values are
+    # face-value percentages (for example OpenCode Go's ``percent: 1``).
+    if direct and 0.0 < percent <= 1.0 and percent != int(percent):
         percent *= 100.0
     return max(0.0, min(100.0, percent))
 
@@ -330,7 +354,15 @@ def parse_usage_payload(data: Any, now: Optional[float] = None) -> list[QuotaWin
 # -- network ------------------------------------------------------------------
 
 
-def fetch_usage(api_key: str) -> QuotaResult:
+def _attempt_usage(api_key: str) -> tuple[Optional[bytes], Optional[str], bool]:
+    """One HTTP GET against the usage API.
+
+    Returns ``(body, None, retryable)`` on success and
+    ``(None, unavailable_reason, retryable)`` on failure.  ``retryable`` marks
+    the failures that are worth another attempt: the endpoint's intermittent
+    503 "Go usage is unavailable", other 5xx/429 statuses, and transport
+    errors.  A rejected credential is never retried.
+    """
     request = urllib.request.Request(
         _API_URL,
         headers={
@@ -342,18 +374,46 @@ def fetch_usage(api_key: str) -> QuotaResult:
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as resp:
-            raw = resp.read()
+            return resp.read(), None, False
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            return build_unavailable(_PROVIDER_ID, "auth-failed")
-        return build_unavailable(_PROVIDER_ID, f"http-{exc.code}")
+            return None, "auth-failed", False
+        if exc.code == 503:
+            # The vendor's own wording for this flap; keep it recognizable
+            # instead of surfacing a bare http-503.
+            return None, "usage-unavailable", True
+        return None, f"http-{exc.code}", exc.code in _TRANSIENT_HTTP_STATUSES
     except Exception as exc:  # noqa: BLE001 - fail-open by contract
-        return build_unavailable(_PROVIDER_ID, f"fetch-error:{type(exc).__name__}")
+        return None, f"fetch-error:{type(exc).__name__}", True
 
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return build_unavailable(_PROVIDER_ID, "bad-json")
+
+def fetch_usage(
+    api_key: str,
+    *,
+    attempts: int = _RETRY_ATTEMPTS,
+    _sleep: Any = time.sleep,
+) -> QuotaResult:
+    total_attempts = max(1, attempts)
+    reason: Optional[str] = None
+    data: Any = None
+
+    for attempt in range(total_attempts):
+        body, reason, retryable = _attempt_usage(api_key)
+        if body is not None:
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = None
+                reason = "bad-json"
+                retryable = True
+            if data is not None:
+                break
+        if not retryable or attempt == total_attempts - 1:
+            break
+        _sleep(_RETRY_BACKOFF_SECONDS[min(attempt, len(_RETRY_BACKOFF_SECONDS) - 1)])
+
+    if data is None:
+        return build_unavailable(_PROVIDER_ID, reason or "no-data")
 
     windows = parse_usage_payload(data)
     plan = None
