@@ -142,13 +142,16 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
     #   fn7 msg            — typed sub-quota: fn1 = kind, fn2 float = % used
     #                        (kind 2 = "Grok Build" on the usage screen)
     #   fn8 msg            — same kind, with fn2/fn3 = start/reset sub-messages
-    #   fn11 varint        — 1 = "Reset Available" (banked usage-limit reset;
-    #                        its expiry date is NOT part of this payload)
+    #   fn11 / fn13 varint — flags with no counterpart in the grok.com UI; left
+    #                        unreported on purpose. A fn11==1 → "Reset banked:
+    #                        available" claim was shipped once and was wrong: the
+    #                        Usage panel for the same payload showed only
+    #                        "Weekly Limit 3% used / Resets …" and "Grok Build 3%".
+    #                        Do not turn an unidentified field into a claim.
     used_percent: Optional[float] = None
     reset_epoch: Optional[int] = None
     kind_used: dict[int, float] = {}
     kind_reset: dict[int, int] = {}
-    reset_banked = False
 
     def _sub_epoch(blob: bytes) -> Optional[int]:
         for sfn, sw, sv in parse(blob):
@@ -191,8 +194,6 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
                         end = epoch
             if kind is not None and end is not None:
                 kind_reset[kind] = end
-        elif fn == 11 and wire == 0:
-            reset_banked = v == 1
 
     if used_percent is None and not kind_used and reset_epoch is None:
         return None
@@ -226,13 +227,9 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
             )
         )
 
-    details: list[str] = []
-    if reset_banked:
-        details.append("Reset banked: available (activate at grok.com)")
-
-    if not windows and not details:
+    if not windows:
         return None
-    return QuotaResult(label="grok", windows=windows, details=details, unavailable_reason=None)
+    return QuotaResult(label="grok", windows=windows, details=[], unavailable_reason=None)
 
 
 def _fetch_grok_rest(cookies: str) -> Optional[QuotaResult]:
@@ -308,8 +305,9 @@ def fetch_grok_quota() -> QuotaResult:
         return build_unavailable("grok", "no-session-cookies")
 
     # Primary: the billing gRPC — this is the "Weekly Limit" + "Grok Build"
-    # usage screen (percent used + reset + banked-reset flag). Verified
-    # 1:1 against the grok.com usage panel.
+    # usage screen (percent used + reset). Verified 1:1 against the grok.com
+    # usage panel: same percentages, same reset instant. Fields the panel does
+    # not render (fn11/fn13 flags) are deliberately not reported.
     headers = {
         "accept": "*/*",
         "content-type": "application/grpc-web+proto",

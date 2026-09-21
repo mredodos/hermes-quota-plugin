@@ -396,7 +396,7 @@ class GrokRestTests(unittest.TestCase):
         "c0e3f16f1a0b08c0ceacd40610c0e3f16f580162006801"
     )
 
-    def test_grpc_fixture_weekly_build_banked(self):
+    def test_grpc_fixture_weekly_build_windows(self):
         from quota_providers import grok
 
         raw = bytes.fromhex(self._GRPC_FIXTURE_HEX)
@@ -410,7 +410,9 @@ class GrokRestTests(unittest.TestCase):
         self.assertAlmostEqual(by_label["Grok Build"].used_percent, 100.0, places=2)
         # Weekly reset: 2026-08-23T17:00:48Z (matches the panel)
         self.assertIn("2026-08-23T17:00:48", by_label["Weekly"].reset_at)
-        self.assertTrue(any("Reset banked" in d for d in res.details))
+        # No detail lines: the vendor panel shows only the windows, so the
+        # parser must not add claims the panel cannot back up.
+        self.assertEqual(res.details, [])
 
     def test_rest_payload_to_windows(self):
         from quota_providers import grok
@@ -446,10 +448,10 @@ class GrokRestTests(unittest.TestCase):
         self.assertEqual(res.unavailable_reason, "cloudflare-blocked")
 
     def test_grpc_no_usage_field_means_zero_percent(self):
-        """Live capture from a free/unused account: the weekly window and
-        banked flag are present but the fn1 usage field is ABSENT — the
-        grok.com panel renders this as "0% utilizado", so the parser must
-        report 0.0 instead of hiding the number."""
+        """Live capture from a free/unused account: the weekly window is present
+        but the fn1 usage field is ABSENT — the grok.com panel renders this as
+        "0% utilizado", so the parser must report 0.0 instead of hiding the
+        number."""
         import struct
 
         from quota_providers import grok
@@ -467,7 +469,6 @@ class GrokRestTests(unittest.TestCase):
 
         sub = b"\x08" + _vi(1788109248)  # fn1 = weekly reset epoch
         inner = b"\x2a" + _vi(len(sub)) + sub  # fn5 = weekly window (no fn1 %)
-        inner += b"\x58\x01"  # fn11 = reset banked
         msg = b"\x0a" + _vi(len(inner)) + inner  # fn1 = response payload
         raw = b"\x00" + struct.pack(">I", len(msg)) + msg
 
@@ -478,7 +479,41 @@ class GrokRestTests(unittest.TestCase):
         self.assertIn("Weekly", by_label)
         self.assertAlmostEqual(by_label["Weekly"].used_percent, 0.0, places=2)
         self.assertIn("2026-08-30T17:00:48", by_label["Weekly"].reset_at)
-        self.assertTrue(any("Reset banked" in d for d in res.details))
+
+    def test_grpc_unknown_flag_fields_do_not_become_detail_claims(self):
+        """Regression: fn11/fn13 carry flags the vendor UI never renders.
+
+        The grok.com Usage panel for the same payload showed only
+        "Weekly Limit 3% used / Resets …" and "Grok Build 3%" — no banked-reset
+        or extra-limit indicator. The parser used to turn fn11=1 into
+        "Reset banked: available (activate at grok.com)", i.e. it stated a reset
+        the account did not have. Unknown flag fields must stay unreported.
+        """
+        import struct
+
+        from quota_providers import grok
+
+        def _vi(n: int) -> bytes:
+            out = bytearray()
+            while True:
+                b = n & 0x7F
+                n >>= 7
+                if n:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        inner = b"\x0d" + struct.pack("<f", 3.0)  # fn1 = Weekly % used
+        inner += b"\x58\x01"  # fn11 = 1 (unknown flag)
+        inner += b"\x68\x01"  # fn13 = 1 (unknown flag)
+        msg = b"\x0a" + _vi(len(inner)) + inner
+        raw = b"\x00" + struct.pack(">I", len(msg)) + msg
+
+        res = grok._parse_grok_protobuf(raw)
+        self.assertIsNotNone(res)
+        self.assertEqual([w.used_percent for w in res.windows], [3.0])
+        self.assertEqual(res.details, [])
 
     def test_optin_disabled_by_default(self):
         from quota_providers import grok
