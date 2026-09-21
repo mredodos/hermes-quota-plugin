@@ -28,11 +28,19 @@ class _FakeResponse(BytesIO):
 
 
 def _raise_closed_http_error(error):
-    """Raise a mocked HTTPError without leaking its response buffer."""
+    """Raise a mocked HTTPError without leaking its response buffer.
+
+    An fp-less HTTPError skips ``addinfourl.__init__``, so on Python 3.9
+    ``close()`` resolves through the tempfile wrapper and raises
+    ``KeyError('file')`` — inside ``finally``, which would replace the error
+    being raised and turn a mocked HTTP failure into ``fetch-error:KeyError``.
+    Nothing is open in that case, so only close when there is a buffer.
+    """
     try:
         raise error
     finally:
-        error.close()
+        if error.fp is not None:
+            error.close()
 
 
 def _urlopen_returning(payload: dict):
