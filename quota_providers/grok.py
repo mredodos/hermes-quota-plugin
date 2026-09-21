@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import time
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -266,15 +265,10 @@ def _fetch_grok_rest(cookies: str) -> Optional[QuotaResult]:
     total = data.get("totalQueries")
     if isinstance(remaining, (int, float)) and isinstance(total, (int, float)) and total > 0:
         used_pct = round(100.0 * (1.0 - float(remaining) / float(total)), 2)
-        reset_iso = None
-        size = data.get("windowSizeSeconds")
-        if isinstance(size, (int, float)) and size > 0:
-            from datetime import datetime, timezone
-
-            reset_iso = datetime.fromtimestamp(
-                time.time() + float(size), tz=timezone.utc
-            ).isoformat()
-        windows.append(QuotaWindow(label="2h", used_percent=used_pct, reset_at=reset_iso))
+        # No reset instant is reported: windowSizeSeconds is the LENGTH of a
+        # rolling window, not an anchor, so any timestamp derived from it would
+        # be invented (the panel's real reset comes from the gRPC path).
+        windows.append(QuotaWindow(label="2h", used_percent=used_pct, reset_at=None))
 
     def _eff(block, label):
         if not isinstance(block, dict):

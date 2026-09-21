@@ -430,10 +430,33 @@ class GrokRestTests(unittest.TestCase):
         labels = [w.label for w in res.windows]
         self.assertEqual(labels[0], "2h")
         self.assertAlmostEqual(res.windows[0].used_percent, 30.0, places=2)
-        self.assertIsNotNone(res.windows[0].reset_at)  # derived from window size
+        # windowSizeSeconds is a rolling-window LENGTH, not an anchor: the
+        # payload carries no reset instant, so none may be reported.
+        self.assertIsNone(res.windows[0].reset_at)
         high = [w for w in res.windows if w.label == "high effort"]
         self.assertEqual(len(high), 1)
         self.assertAlmostEqual(high[0].used_percent, 60.0, places=2)
+
+    def test_rest_window_does_not_invent_a_reset_instant(self):
+        """Regression: the REST fallback used to report ``now + windowSizeSeconds``
+        as the reset time, which produced a reset ("2h 100% (reset today 19:41)")
+        that the account never had — the grok.com Usage panel showed a different
+        meter entirely (Weekly Limit / Grok Build). A rolling window exposes only
+        its length, so the reset instant must stay unset."""
+        from quota_providers import grok
+
+        payload = {
+            "remainingQueries": 0,
+            "totalQueries": 10,
+            "windowSizeSeconds": 7200,
+            "lowEffortRateLimits": None,
+            "highEffortRateLimits": None,
+        }
+        with mock.patch.object(grok.urllib.request, "urlopen", _urlopen_returning(payload)):
+            res = grok._fetch_grok_rest("cookie=1")
+        self.assertEqual(len(res.windows), 1)
+        self.assertAlmostEqual(res.windows[0].used_percent, 100.0, places=2)
+        self.assertIsNone(res.windows[0].reset_at)
 
     def test_auth_failure_is_reported_not_swallowed(self):
         import urllib.error
