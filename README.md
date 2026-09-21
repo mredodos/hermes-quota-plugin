@@ -12,7 +12,7 @@ the bottom, next to the client/backend version label:
 **Contents** — [Install](#install) · [What you get](#what-you-get) ·
 [Providers](#providers) · [How it works](#how-it-works) ·
 [Troubleshooting](#troubleshooting) · [Privacy](#privacy--safety) ·
-[Development](#development)
+[Development](#development) · [Credits](#credits)
 
 ## Install
 
@@ -267,5 +267,13 @@ AREA=statusbar.right node scripts/render-widget.cjs   # status bar chip
 To add a provider, write a fetcher in `quota_providers/` that returns a
 `QuotaResult` and register it. The cache and the widget need no
 provider-specific changes.
+
+## Credits
+
+Community work integrated into this plugin, with thanks:
+
+- [@tdoan35](https://github.com/tdoan35) for the Z.ai Coding Plan provider, the
+  gateway-diagnostics JSON fix and the Codex usage-URL helper fix (#12, #13, #14)
+- [@Hyp4tia](https://github.com/Hyp4tia) for the CommandCode provider (#15)
 
 MIT.
