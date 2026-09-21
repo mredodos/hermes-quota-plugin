@@ -66,6 +66,8 @@ def _is_tcc_error(exc: BaseException) -> bool:
 _CHROME_EPOCH_DELTA_S = 11_644_473_600
 _CHROME_KEY_SALT = b"saltysalt"
 _CHROME_KEY_ITERS = 1003
+# Linux browsers derive the Safe Storage key with a single PBKDF2 round.
+_CHROME_KEY_ITERS_LINUX = 1
 _CHROME_CBC_IV = b" " * 16
 
 
@@ -137,17 +139,42 @@ def load_firefox_grok_cookies() -> Optional[str]:
     return None
 
 
+def _linux_config_home() -> Path:
+    """Config dir where Linux Chromium/Chrome/Brave keep their profiles."""
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    return Path(configured) if configured else Path.home() / ".config"
+
+
 def _chrome_user_data_roots() -> list[Path]:
-    # Decrypt is macOS Keychain only. Do not scan Windows/Linux Chrome roots.
-    if sys.platform != "darwin":
+    """Existing browser user-data roots on this platform.
+
+    macOS reads the Keychain and Linux the login keyring (secret-tool), so both
+    are supported; Windows is not (DPAPI key).
+    """
+    if sys.platform == "darwin":
+        candidates = [Path.home() / "Library" / "Application Support" / "Google" / "Chrome"]
+    elif sys.platform.startswith("linux"):
+        config = _linux_config_home()
+        candidates = [
+            config / "chromium",
+            config / "google-chrome",
+            config / "google-chrome-beta",
+            config / "google-chrome-unstable",
+            config / "BraveSoftware" / "Brave-Browser",
+            config / "BraveSoftware" / "Brave-Browser-Beta",
+            config / "BraveSoftware" / "Brave-Browser-Dev",
+        ]
+    else:
         return []
-    path = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
-    try:
-        return [path] if path.exists() else []
-    except OSError as exc:
-        if _is_tcc_error(exc):
-            _raise_chrome_tcc()
-        return []
+    roots: list[Path] = []
+    for path in candidates:
+        try:
+            if path.exists():
+                roots.append(path)
+        except OSError as exc:
+            if _is_tcc_error(exc):
+                _raise_chrome_tcc()
+    return roots
 
 
 def _chrome_last_used_profile(root: Path) -> Optional[str]:
@@ -246,8 +273,56 @@ def chrome_cookie_dbs() -> list[Path]:
     return dbs
 
 
-def _chrome_safe_storage_password() -> Optional[str]:
+# Linux keeps the "Safe Storage" password in the login keyring; these are the
+# lookups the browsers themselves use (newest xdg:schema form last).
+_LINUX_SECRET_LOOKUPS: dict[str, tuple[tuple[str, str], ...]] = {
+    "chrome": (
+        ("application", "chrome"),
+        ("xdg:schema", "chrome_libsecret_os_crypt_password_v2"),
+    ),
+    "chromium": (
+        ("application", "chromium"),
+        ("xdg:schema", "chromium_libsecret_os_crypt_password_v2"),
+    ),
+    "brave": (
+        ("application", "brave"),
+        ("xdg:schema", "brave_libsecret_os_crypt_password_v2"),
+    ),
+}
+# Chromium started without a keyring (--password-store=basic) uses this
+# well-known password; a wrong candidate simply fails to decrypt.
+_LINUX_FALLBACK_PASSWORD = "peanuts"
+
+
+def _linux_keyring_password(app: str) -> Optional[str]:
+    if not shutil.which("secret-tool"):
+        return None
+    for attribute, value in _LINUX_SECRET_LOOKUPS.get(app, ()):
+        try:
+            completed = subprocess.run(
+                ["secret-tool", "lookup", attribute, value],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode == 0:
+            password = (completed.stdout or "").strip()
+            if password:
+                return password
+    return None
+
+
+def _chrome_safe_storage_password(app: str = "chrome") -> Optional[str]:
+    """Safe Storage password for one browser, or None when unavailable."""
+    if sys.platform.startswith("linux"):
+        return _linux_keyring_password(app)
     if sys.platform != "darwin":
+        return None
+    if app != "chrome":
+        # Only Google Chrome's Keychain item is read on macOS.
         return None
     try:
         completed = subprocess.run(
@@ -273,6 +348,17 @@ def _chrome_safe_storage_password() -> Optional[str]:
     return password or None
 
 
+def _chrome_key_iterations() -> int:
+    """PBKDF2 rounds for the Safe Storage password.
+
+    macOS Chrome derives with 1003 rounds; Linux Chromium/Chrome/Brave use one
+    round (verified live: 1003 fails on Linux v11 blobs, 1 decrypts them).
+    """
+    if sys.platform.startswith("linux"):
+        return _CHROME_KEY_ITERS_LINUX
+    return _CHROME_KEY_ITERS
+
+
 def _derive_chrome_key(password: str) -> bytes:
     if not _HAS_CRYPTO:
         raise ChromeCookieError("chrome-crypto-missing")
@@ -283,15 +369,26 @@ def _derive_chrome_key(password: str) -> bytes:
         algorithm=hashes.SHA1(),
         length=16,
         salt=_CHROME_KEY_SALT,
-        iterations=_CHROME_KEY_ITERS,
+        iterations=_chrome_key_iterations(),
     ).derive(password.encode("utf-8"))
 
 
-def _chrome_aes_key() -> bytes:
-    password = _chrome_safe_storage_password()
-    if not password:
+def _chrome_aes_keys(app: str = "chrome") -> list[bytes]:
+    """Candidate AES keys for one browser's cookie DB, best guess first."""
+    keys: list[bytes] = []
+    password = _chrome_safe_storage_password(app)
+    if password:
+        keys.append(_derive_chrome_key(password))
+    if sys.platform.startswith("linux"):
+        keys.append(_derive_chrome_key(_LINUX_FALLBACK_PASSWORD))
+    if not keys:
         raise ChromeCookieError("chrome-keychain-denied")
-    return _derive_chrome_key(password)
+    return keys
+
+
+def _chrome_aes_key() -> bytes:
+    """Single-key form (macOS Keychain path)."""
+    return _chrome_aes_keys("chrome")[0]
 
 
 def _strip_chrome_host_hash(plaintext: bytes, host_key: Optional[str] = None) -> bytes:
@@ -363,8 +460,23 @@ def _chrome_expiry_cutoff(now: float) -> int:
     return int((now + _CHROME_EPOCH_DELTA_S) * 1_000_000)
 
 
+def _chrome_app_for_path(path: Path) -> str:
+    """Which browser's Safe Storage secret encrypts this cookie DB."""
+    lowered = str(path).lower()
+    if "brave" in lowered:
+        return "brave"
+    if "chromium" in lowered:
+        return "chromium"
+    return "chrome"
+
+
 def load_chrome_grok_cookies() -> Optional[str]:
-    if sys.platform != "darwin":
+    """Cookie header for grok.com from a local browser profile, or None.
+
+    macOS reads the Keychain, Linux the login keyring (secret-tool); Windows is
+    unsupported (DPAPI).
+    """
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
         return None
     try:
         sources = chrome_cookie_dbs()
@@ -377,7 +489,7 @@ def load_chrome_grok_cookies() -> Optional[str]:
 
     now = time.time()
     cutoff = _chrome_expiry_cutoff(now)
-    key: Optional[bytes] = None
+    keys_by_app: dict[str, list[bytes]] = {}
     decrypt_reason: Optional[str] = None
 
     for source in sources:
@@ -411,19 +523,31 @@ def load_chrome_grok_cookies() -> Optional[str]:
                 continue
             if not isinstance(blob, (bytes, bytearray)):
                 continue
-            if key is None:
-                key = _chrome_aes_key()
-            try:
-                value = decrypt_chrome_cookie_value(key, bytes(blob), host_key=str(host_key or ""))
-            except ChromeCookieError as exc:
-                if exc.reason in _HARD_CHROME_FAILURES:
-                    raise
-                # Soft failure: record the typed reason and try the next
-                # source database instead of aborting the whole import.
-                decrypt_reason = exc.reason
-                continue
-            except Exception as exc:
-                raise ChromeCookieError("chrome-decrypt-failed") from exc
+            app = _chrome_app_for_path(source)
+            keys = keys_by_app.get(app)
+            if keys is None:
+                # Resolved lazily: a profile with no grok cookies must not fail
+                # just because no keyring secret is available.
+                keys = _chrome_aes_keys(app)
+                keys_by_app[app] = keys
+            value: Optional[str] = None
+            for candidate in keys:
+                try:
+                    value = decrypt_chrome_cookie_value(
+                        candidate, bytes(blob), host_key=str(host_key or "")
+                    )
+                except ChromeCookieError as exc:
+                    if exc.reason in _HARD_CHROME_FAILURES:
+                        raise
+                    # Soft failure: record the typed reason and try the next
+                    # candidate key / source database instead of aborting.
+                    decrypt_reason = exc.reason
+                    value = None
+                    continue
+                except Exception as exc:
+                    raise ChromeCookieError("chrome-decrypt-failed") from exc
+                if value:
+                    break
             if value:
                 pairs.append((str(name), value))
         header = _cookie_header(iter(pairs))

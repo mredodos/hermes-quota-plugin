@@ -180,18 +180,24 @@ Cookie sources, in order:
 
 1. `~/grok_session.json` if you created one yourself
 2. Firefox `grok.com` cookies
-3. Google Chrome `grok.com` cookies (macOS)
+3. Chromium / Google Chrome / Brave `grok.com` cookies (macOS and Linux)
 
-Chrome notes:
+Browser notes:
 
-- Sign into <https://grok.com> in Chrome at least once.
-- macOS prompts for the `Chrome Safe Storage` Keychain item on first refresh.
+- Sign into <https://grok.com> in the browser at least once.
+- macOS reads the `Chrome Safe Storage` Keychain item (prompted on first
+  refresh) and derives the AES key with 1003 PBKDF2 rounds.
+- Linux reads the login keyring with
+  `secret-tool lookup application chromium` (or `chrome` / `brave`, matching the
+  profile that owns the cookie DB) and derives with a single PBKDF2 round —
+  profiles created with `--password-store=basic` fall back to the well-known
+  `peanuts` password.
 - If refresh returns `chrome-tcc-denied`, grant Full Disk Access to
   **Hermes.app** (Desktop) and/or the Terminal you use for `hermes quota refresh`,
   then retry.
-- Chrome 127+ cookies prefix a SHA256(`host_key`) digest before the value; that
+- Chromium 127+ cookies prefix a SHA256(`host_key`) digest before the value; that
   prefix is stripped after AES-CBC decrypt.
-- Chrome App-Bound `v20` cookies are not supported (`chrome-app-bound`).
+- App-Bound `v20` cookies are not supported (`chrome-app-bound`).
 - Safari is not supported.
 
 ## How it works
@@ -227,7 +233,8 @@ backend spawn.
 | `unavailable (503 …)` for opencode-go | Upstream flakiness, not your key | The fetcher already retries; it recovers on a later poll |
 | Numbers not changing | Check the pane footer: `· <age> old · poll <N>s` | If the age grows past the interval, report it — the poll should be exact |
 | `chrome-tcc-denied` / `chrome-keychain-denied` | macOS privacy prompts | Grant Full Disk Access / approve the Keychain item, then retry |
-| `chrome-app-bound` | Chrome App-Bound `v20` cookies | Not supported; use Firefox or `~/grok_session.json` |
+| `chrome-decrypt-failed` on Linux | Keyring locked or profile belongs to another browser | Unlock the login keyring, or check the profile is Chromium/Chrome/Brave |
+| `chrome-app-bound` | App-Bound `v20` cookies | Not supported; use Firefox or `~/grok_session.json` |
 | `chrome-crypto-missing` | Missing dependency | Install the `cryptography` package |
 
 Typed failure reasons surfaced by a refresh: `chrome-tcc-denied`,
