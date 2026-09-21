@@ -388,30 +388,31 @@ class GeminiFetcherTests(unittest.TestCase):
 class GrokRestTests(unittest.TestCase):
     # Live capture of the billing gRPC response (GetGrokCreditsConfig), the
     # same bytes that render grok.com's usage screen at capture time:
-    # Weekly Limit 100% used (resets Aug 23 17:00Z), Grok Build kind-2 quota
-    # also present, "Reset Available" flag set.
+    # Weekly Limit 100% used (resets Aug 23 17:00Z) with the kind-2 entry
+    # ("Grok Build") that the panel draws as the LEGEND under the single bar,
+    # plus an fn11 flag the panel never renders.
     _GRPC_FIXTURE_HEX = (
         "00000000520a500d0000c84212001a00220b08c0d987d40610c0e3f16f2a0b08"
         "c0ceacd40610c0e3f16f3a070802150000c842421c0802120b08c0d987d40610"
         "c0e3f16f1a0b08c0ceacd40610c0e3f16f580162006801"
     )
 
-    def test_grpc_fixture_weekly_build_windows(self):
+    def test_grpc_fixture_reports_the_single_panel_meter(self):
+        """The usage panel renders ONE bar ("Weekly Limit … 3% used / Resets …")
+        with "Grok Build 3%" as its legend line. Reporting the kind entry as a
+        second quota showed two quotas with the same % and the same reset date
+        but different names — the panel has only one."""
         from quota_providers import grok
 
         raw = bytes.fromhex(self._GRPC_FIXTURE_HEX)
         res = grok._parse_grok_protobuf(raw)
         self.assertIsNotNone(res)
         self.assertIsNone(res.unavailable_reason)
-        by_label = {w.label: w for w in res.windows}
-        self.assertIn("Weekly", by_label)
-        self.assertAlmostEqual(by_label["Weekly"].used_percent, 100.0, places=2)
-        self.assertIn("Grok Build", by_label)
-        self.assertAlmostEqual(by_label["Grok Build"].used_percent, 100.0, places=2)
+        self.assertEqual([w.label for w in res.windows], ["Weekly Limit"])
+        self.assertAlmostEqual(res.windows[0].used_percent, 100.0, places=2)
         # Weekly reset: 2026-08-23T17:00:48Z (matches the panel)
-        self.assertIn("2026-08-23T17:00:48", by_label["Weekly"].reset_at)
-        # No detail lines: the vendor panel shows only the windows, so the
-        # parser must not add claims the panel cannot back up.
+        self.assertIn("2026-08-23T17:00:48", res.windows[0].reset_at)
+        # The kind breakdown is a legend segment, not a meter of its own.
         self.assertEqual(res.details, [])
 
     def test_rest_payload_to_windows(self):
@@ -498,10 +499,52 @@ class GrokRestTests(unittest.TestCase):
         res = grok._parse_grok_protobuf(raw)
         self.assertIsNotNone(res)
         self.assertIsNone(res.unavailable_reason)
-        by_label = {w.label: w for w in res.windows}
-        self.assertIn("Weekly", by_label)
-        self.assertAlmostEqual(by_label["Weekly"].used_percent, 0.0, places=2)
-        self.assertIn("2026-08-30T17:00:48", by_label["Weekly"].reset_at)
+        self.assertEqual([w.label for w in res.windows], ["Weekly Limit"])
+        self.assertAlmostEqual(res.windows[0].used_percent, 0.0, places=2)
+        self.assertIn("2026-08-30T17:00:48", res.windows[0].reset_at)
+
+    def test_grpc_kind_entry_is_not_a_second_quota(self):
+        """Regression: the kind-2 entry ("Grok Build") is the legend segment of
+        the same weekly bar, so it must not be published as a second window.
+
+        The plugin showed two quotas with the same percentage and the same reset
+        date under different names ("Weekly" + "Grok Build"); the vendor panel
+        renders a single bar titled "Weekly Limit" with "Grok Build 3%" as its
+        legend line.
+        """
+        import struct
+
+        from quota_providers import grok
+
+        def _vi(n: int) -> bytes:
+            out = bytearray()
+            while True:
+                b = n & 0x7F
+                n >>= 7
+                if n:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        def _sub(field: int, payload: bytes) -> bytes:
+            return bytes([field << 3 | 2]) + _vi(len(payload)) + payload
+
+        reset = b"\x08" + _vi(1790528448)  # fn1 = reset epoch (2026-09-27T17:00:48Z)
+        inner = b"\x0d" + struct.pack("<f", 3.0)  # fn1 = Weekly % used
+        inner += _sub(5, reset)  # fn5 = weekly window reset
+        kind = b"\x08\x02" + b"\x15" + struct.pack("<f", 3.0)  # fn1 = kind 2, fn2 = %
+        inner += _sub(7, kind)  # fn7 = kind entry (legend segment)
+        inner += _sub(8, b"\x08\x02" + _sub(3, reset))  # fn8 = kind window
+        msg = b"\x0a" + _vi(len(inner)) + inner
+        raw = b"\x00" + struct.pack(">I", len(msg)) + msg
+
+        res = grok._parse_grok_protobuf(raw)
+        self.assertIsNotNone(res)
+        self.assertEqual([w.label for w in res.windows], ["Weekly Limit"])
+        self.assertAlmostEqual(res.windows[0].used_percent, 3.0, places=2)
+        self.assertIn("2026-09-27T17:00:48", res.windows[0].reset_at)
+        self.assertEqual(res.details, [])
 
     def test_grpc_unknown_flag_fields_do_not_become_detail_claims(self):
         """Regression: fn11/fn13 carry flags the vendor UI never renders.

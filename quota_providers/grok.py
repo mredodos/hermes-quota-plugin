@@ -138,9 +138,11 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
     #                        grok.com panel renders "0% utilizado" when the
     #                        field is missing, e.g. free/unused accounts)
     #   fn4 / fn5 msg      — Weekly window start / reset (fn1 = epoch seconds)
-    #   fn7 msg            — typed sub-quota: fn1 = kind, fn2 float = % used
-    #                        (kind 2 = "Grok Build" on the usage screen)
-    #   fn8 msg            — same kind, with fn2/fn3 = start/reset sub-messages
+    #   fn7 / fn8 msg      — typed breakdown of the SAME window: fn1 = kind,
+    #                        fn2 float = % used. The panel draws these as the
+    #                        legend under the single bar ("Grok Build 3%"), not
+    #                        as extra meters — publishing them as windows showed
+    #                        two quotas with the same % and reset date.
     #   fn11 / fn13 varint — flags with no counterpart in the grok.com UI; left
     #                        unreported on purpose. A fn11==1 → "Reset banked:
     #                        available" claim was shipped once and was wrong: the
@@ -149,8 +151,6 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
     #                        Do not turn an unidentified field into a claim.
     used_percent: Optional[float] = None
     reset_epoch: Optional[int] = None
-    kind_used: dict[int, float] = {}
-    kind_reset: dict[int, int] = {}
 
     def _sub_epoch(blob: bytes) -> Optional[int]:
         for sfn, sw, sv in parse(blob):
@@ -168,33 +168,8 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
             epoch = _sub_epoch(v)
             if epoch is not None and (reset_epoch is None or epoch > reset_epoch):
                 reset_epoch = epoch
-        elif fn == 7 and wire == 2:
-            kind: Optional[int] = None
-            val: Optional[float] = None
-            for sfn, sw, sv in parse(v):
-                if sfn == 1 and sw == 0:
-                    kind = sv
-                elif sfn == 2 and sw == 5:
-                    try:
-                        val = float(sv)
-                    except (TypeError, ValueError):
-                        val = None
-            if kind is not None and val is not None:
-                kind_used[kind] = val
-        elif fn == 8 and wire == 2:
-            kind = None
-            end: Optional[int] = None
-            for sfn, sw, sv in parse(v):
-                if sfn == 1 and sw == 0:
-                    kind = sv
-                elif sfn == 3 and sw == 2:
-                    epoch = _sub_epoch(sv)
-                    if epoch is not None:
-                        end = epoch
-            if kind is not None and end is not None:
-                kind_reset[kind] = end
 
-    if used_percent is None and not kind_used and reset_epoch is None:
+    if used_percent is None and reset_epoch is None:
         return None
 
     from datetime import datetime, timezone
@@ -214,15 +189,8 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
         used_percent = 0.0
     if used_percent is not None or reset_epoch is not None:
         windows.append(
-            QuotaWindow(label="Weekly", used_percent=used_percent, reset_at=_iso(reset_epoch))
-        )
-    kind_labels = {2: "Grok Build"}
-    for kind, val in kind_used.items():
-        windows.append(
             QuotaWindow(
-                label=kind_labels.get(kind, f"quota kind {kind}"),
-                used_percent=val,
-                reset_at=_iso(kind_reset.get(kind)),
+                label="Weekly Limit", used_percent=used_percent, reset_at=_iso(reset_epoch)
             )
         )
 
