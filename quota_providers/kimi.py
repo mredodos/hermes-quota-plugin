@@ -69,6 +69,10 @@ def _load_hermes_creds() -> tuple[Optional[str], Optional[str]]:
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_api_key_provider_secret
         try:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+        except ImportError:
+            get_env_value_prefer_dotenv = None
+        try:
             from hermes_cli.auth import _resolve_kimi_base_url
         except ImportError:
             _resolve_kimi_base_url = None
@@ -78,7 +82,9 @@ def _load_hermes_creds() -> tuple[Optional[str], Optional[str]]:
         key, _source = _resolve_api_key_provider_secret("kimi-coding", pconfig)
         if not key:
             return None, None
-        env_url = os.environ.get("KIMI_BASE_URL", "").strip()
+        env_url = ((get_env_value_prefer_dotenv(pconfig.base_url_env_var)
+                    if get_env_value_prefer_dotenv is not None and pconfig.base_url_env_var
+                    else os.environ.get("KIMI_BASE_URL", "")) or "").strip()
         if _resolve_kimi_base_url is not None:
             base = _resolve_kimi_base_url(key, pconfig.inference_base_url, env_url)
         else:  # older core without the helper: replicate the redirect

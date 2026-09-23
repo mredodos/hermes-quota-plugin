@@ -647,6 +647,29 @@ class KimiFetcherTests(unittest.TestCase):
         self.assertEqual(req.full_url, "https://api.kimi.com/coding/v1/usages")
         self.assertEqual(req.get_header("Authorization"), "Bearer sk-kimi-test")
 
+    def test_hermes_dotenv_base_url_override_is_honored(self):
+        """Use the core dotenv-aware resolver, rather than process env only."""
+        from quota_providers import kimi
+
+        pconfig = types.SimpleNamespace(
+            auth_type="api_key", inference_base_url="https://api.moonshot.ai/v1",
+            base_url_env_var="KIMI_BASE_URL")
+        base_url = mock.Mock(return_value="https://proxy.example/v1")
+        auth = types.ModuleType("hermes_cli.auth")
+        config = types.ModuleType("hermes_cli.config")
+        setattr(auth, "PROVIDER_REGISTRY", {"kimi-coding": pconfig})
+        setattr(auth, "_resolve_api_key_provider_secret", mock.Mock(
+            return_value=("sk-kimi-test", "dotenv")))
+        setattr(config, "get_env_value_prefer_dotenv", base_url)
+        setattr(auth, "_resolve_kimi_base_url",
+                lambda _key, default, override: override or default)
+        with mock.patch.dict(sys.modules, {"hermes_cli.auth": auth,
+                                           "hermes_cli.config": config}):
+            key, resolved_url = kimi._load_hermes_creds()
+        self.assertEqual(key, "sk-kimi-test")
+        self.assertEqual(resolved_url, "https://proxy.example/v1")
+        base_url.assert_called_once_with("KIMI_BASE_URL")
+
     def test_live_payload_shape_parsed(self):
         """Real 2026-09 payload: usages ratios + string-valued RPM limits."""
         from quota_providers import kimi
